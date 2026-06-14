@@ -8,6 +8,8 @@ define('DB_PASS', 'meinsql123');
 
 define('ADMIN_USER', 'meinsql');
 define('ADMIN_PASS', 'meinsql123');
+
+define('ALLOW_DROP_TABLE', true);   // set to false to disable DROP TABLE
 // ────────────────────────────────────────────────────────────────────────────
 
 session_start();
@@ -47,6 +49,37 @@ function deleteRateCheck(): bool {
     $data['count']++;
     $_SESSION['del_rate'] = $data;
     return true;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Export SQL dump (GET, authenticated) ────────────────────────────────────
+if (isset($_GET['action']) && $_GET['action'] === 'export_sql' && !empty($_SESSION['auth'])) {
+    $onlyTable = $_GET['table'] ?? '';
+    $tables    = ($onlyTable && validTable($onlyTable)) ? [$onlyTable] : getTables();
+    $filename  = $onlyTable ? $onlyTable . '.sql' : DB_NAME . '_dump.sql';
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^a-zA-Z0-9_.-]/', '_', $filename) . '"');
+    echo "-- meinSQL dump\n-- Database: " . DB_NAME . "\n-- Date: " . date('Y-m-d H:i:s') . "\n\nSET FOREIGN_KEY_CHECKS=0;\n\n";
+    foreach ($tables as $t) {
+        echo "-- --------------------------------------------------------\n-- Table: `$t`\n\n";
+        echo "DROP TABLE IF EXISTS " . quoteId($t) . ";\n";
+        $create = db()->query('SHOW CREATE TABLE ' . quoteId($t))->fetch();
+        echo $create['Create Table'] . ";\n\n";
+        $rows = db()->query('SELECT * FROM ' . quoteId($t))->fetchAll();
+        if ($rows) {
+            $colList = implode(', ', array_map('quoteId', array_keys($rows[0])));
+            foreach ($rows as $row) {
+                $vals = array_map(function($v) {
+                    if ($v === null) return 'NULL';
+                    return "'" . str_replace(['\\', "'", "\n", "\r", "\x1a"], ['\\\\', "\\'", '\\n', '\\r', '\\Z'], $v) . "'";
+                }, array_values($row));
+                echo "INSERT INTO " . quoteId($t) . " ($colList) VALUES (" . implode(', ', $vals) . ");\n";
+            }
+            echo "\n";
+        }
+    }
+    echo "SET FOREIGN_KEY_CHECKS=1;\n";
+    exit;
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -94,6 +127,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     if (!empty($_SESSION['auth'])) {
       csrfCheck();
       try {
+        if ($_POST['action'] === 'import_sql') {
+            $file = $_FILES['sqlfile'] ?? null;
+            if ($file && $file['error'] === UPLOAD_ERR_OK) {
+                $sql   = file_get_contents($file['tmp_name']);
+                $stmts = splitSql($sql);
+                $ok = 0; $skipped = 0; $errs = [];
+                foreach ($stmts as $s) {
+                    if (!ALLOW_DROP_TABLE && preg_match('/^\s*DROP\s+TABLE\s/i', $s)) {
+                        $skipped++; continue;
+                    }
+                    try { db()->exec($s); $ok++; }
+                    catch (Exception $e) { $errs[] = $e->getMessage(); }
+                }
+                $_SESSION['flash_import'] = ['ok' => $ok, 'skipped' => $skipped, 'errors' => array_slice($errs, 0, 5)];
+            } else {
+                $_SESSION['flash_error'] = 'Ficheiro inválido ou erro no upload.';
+            }
+            $back = $_POST['table'] ?? '';
+            header('Location: ' . $_SERVER['PHP_SELF'] . ($back ? '?table=' . urlencode($back) : ''));
+            exit;
+        }
+
         if ($_POST['action'] === 'run_query') {
             $sql = trim($_POST['sql'] ?? '');
             if ($sql) {
@@ -117,7 +172,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         if ($_POST['action'] === 'drop_table') {
             $table   = $_POST['table']   ?? '';
             $confirm = $_POST['confirm'] ?? '';
-            if ($table && $confirm === $table && validTable($table)) {
+            if (!ALLOW_DROP_TABLE) {
+                $_SESSION['flash_error'] = 'DROP TABLE está desactivado nas configurações.';
+            } elseif ($table && $confirm === $table && validTable($table)) {
                 db()->exec('DROP TABLE ' . quoteId($table));
             }
             header('Location: ' . $_SERVER['PHP_SELF']);
@@ -297,6 +354,30 @@ function db(): PDO {
         ]);
     }
     return $pdo;
+}
+
+function splitSql(string $sql): array {
+    $stmts = []; $cur = ''; $inStr = false; $strCh = '';
+    for ($i = 0, $len = strlen($sql); $i < $len; $i++) {
+        $c = $sql[$i];
+        if (!$inStr && $c === '-' && ($sql[$i+1] ?? '') === '-') {
+            $end = strpos($sql, "\n", $i); $i = $end === false ? $len : $end; continue;
+        }
+        if (!$inStr && $c === '/' && ($sql[$i+1] ?? '') === '*') {
+            $end = strpos($sql, '*/', $i + 2); $i = $end === false ? $len : $end + 1; continue;
+        }
+        if ($inStr) {
+            if ($c === '\\') { $cur .= $c . ($sql[++$i] ?? ''); }
+            elseif ($c === $strCh) { $inStr = false; $cur .= $c; }
+            else { $cur .= $c; }
+        } else {
+            if ($c === "'" || $c === '"') { $inStr = true; $strCh = $c; $cur .= $c; }
+            elseif ($c === ';') { $s = trim($cur); if ($s !== '') $stmts[] = $s; $cur = ''; }
+            else { $cur .= $c; }
+        }
+    }
+    $s = trim($cur); if ($s !== '') $stmts[] = $s;
+    return $stmts;
 }
 
 function validTable(string $table): bool {
@@ -537,6 +618,8 @@ function getTables(): array {
   <strong>meinSQL</strong>
   <span><?= h($_SESSION['user']) ?></span>
   <button id="themeToggle" title="Toggle theme">🌙</button>
+  <a href="?action=export_sql" role="button" class="outline" title="Dump entire DB as SQL" style="font-size:.78rem;padding:.2rem .6rem">💾 Dump DB</a>
+  <button type="button" class="outline" onclick="document.getElementById('importDialog').showModal()" style="font-size:.78rem;padding:.2rem .6rem;margin:0">📥 Import</button>
   <form method="POST">
     <input type="hidden" name="action" value="logout">
     <input type="hidden" name="_csrf" value="<?= h(csrfToken()) ?>">
@@ -587,7 +670,9 @@ if ($activeTable && validTable($activeTable)) {
       <div style="display:flex;gap:.3rem;align-items:center">
         <?php if ($activeTable && $cols): ?>
           <button class="collapse-btn" style="padding:0 .3rem;font-size:.7rem" onclick="document.getElementById('addColDialog').showModal()" title="Add column">+</button>
+          <?php if (ALLOW_DROP_TABLE): ?>
           <button class="collapse-btn" style="padding:0 .3rem;font-size:.7rem;color:#c62828" onclick="openDropTable('<?= h(addslashes($activeTable)) ?>')" title="Drop table">🗑</button>
+          <?php endif ?>
         <?php endif ?>
         <button class="collapse-btn" data-pane="paneMiddle">◀</button>
       </div>
@@ -622,6 +707,12 @@ if ($activeTable && validTable($activeTable)) {
         ⚠ <?= h($_SESSION['flash_error']) ?>
       </div>
       <?php unset($_SESSION['flash_error']); ?>
+    <?php endif ?>
+    <?php if (!empty($_SESSION['flash_import'])): $fi = $_SESSION['flash_import']; unset($_SESSION['flash_import']); ?>
+      <div style="background:<?= empty($fi['errors']) ? '#e8f5e9' : '#fff8e1' ?>;border:1px solid <?= empty($fi['errors']) ? '#a5d6a7' : '#ffe082' ?>;color:<?= empty($fi['errors']) ? '#1b5e20' : '#e65100' ?>;padding:.5rem .75rem;border-radius:4px;font-size:.82rem;margin-bottom:.75rem">
+        ✓ <?= $fi['ok'] ?> statement(s) executados com sucesso.<?= ($fi['skipped'] ?? 0) > 0 ? ' ' . $fi['skipped'] . ' DROP TABLE ignorado(s).' : '' ?>
+        <?php foreach ($fi['errors'] as $err): ?><br><small>⚠ <?= h($err) ?></small><?php endforeach ?>
+      </div>
     <?php endif ?>
   <?php if ($activeTable && $cols): ?>
     <?php
@@ -662,6 +753,7 @@ if ($activeTable && validTable($activeTable)) {
         <a href="?table=<?= urlencode($activeTable) ?>&edit=__new__" role="button">+ Insert</a>
       <?php endif ?>
       <a href="?table=<?= urlencode($activeTable) ?>&action=export_csv" role="button" class="outline" title="Export CSV" style="font-size:.78rem;padding:.2rem .55rem">⬇ CSV</a>
+      <a href="?table=<?= urlencode($activeTable) ?>&action=export_sql" role="button" class="outline" title="Export SQL dump" style="font-size:.78rem;padding:.2rem .55rem">⬇ SQL</a>
       <button type="button" class="outline" onclick="document.getElementById('sqlDialog').showModal()" style="font-size:.78rem;padding:.2rem .55rem;margin:0">⌨ SQL</button>
       <details class="col-picker">
         <summary>Columns</summary>
@@ -952,6 +1044,35 @@ if (isset($_GET['qr']) && !empty($_SESSION['query_result'])) {
   </article>
 </dialog>
 <?php endif ?>
+
+<!-- ─── Import SQL dialog ──────────────────────────────────────────────────── -->
+<dialog id="importDialog">
+  <article>
+    <header>
+      <h6>📥 Import SQL</h6>
+      <button type="button" class="btn-cancel" onclick="this.closest('dialog').close()" style="padding:.2rem .6rem;font-size:.85rem">×</button>
+    </header>
+    <form method="POST" enctype="multipart/form-data">
+      <input type="hidden" name="action" value="import_sql">
+      <input type="hidden" name="_csrf"  value="<?= h(csrfToken()) ?>">
+      <?php if ($activeTable ?? false): ?><input type="hidden" name="table" value="<?= h($activeTable) ?>"><?php endif ?>
+      <div class="dialog-body">
+        <div class="field">
+          <label>Ficheiro .sql</label>
+          <input type="file" name="sqlfile" accept=".sql,text/plain" required style="padding:.3rem 0">
+        </div>
+        <p style="font-size:.78rem;color:var(--pico-muted-color);margin:0">
+          O ficheiro será executado statement a statement.<br>
+          ⚠ Esta operação pode modificar ou destruir dados.
+        </p>
+      </div>
+      <footer>
+        <button type="button" class="btn-cancel" onclick="this.closest('dialog').close()">Cancel</button>
+        <button type="submit" class="btn-submit" onclick="return confirm('Tens a certeza? Isto irá executar o SQL no ficheiro.')">Import</button>
+      </footer>
+    </form>
+  </article>
+</dialog>
 
 <!-- ─── Drop Table dialog ───────────────────────────────────────────────────── -->
 <dialog id="dropTableDialog">

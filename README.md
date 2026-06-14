@@ -10,17 +10,20 @@ A minimal, single-file PHP MySQL admin panel. Drop it anywhere and it works.
 
 ## Features
 
-- **Single file** — everything in `index.php` (~64KB)
+- **Single file** — everything in `index.php` (~68KB)
 - **Zero dependencies** — no Composer, no npm, no framework
 - **Session login** with brute-force IP rate limiting (5 attempts / 10 min)
 - **3-pane layout** — tables list / schema / records, all resizable and collapsible
 - **Browse & search** — paginated records (20/50/100), sort by column, full-text search across text columns
 - **CRUD** — insert, edit, delete rows with smart field types (date picker, enum select, password hash)
 - **Schema tools** — view columns/types, add column (INT, DOUBLE, VARCHAR, TEXT, DATE, ENUM), create table, drop table
-- **Export CSV** — one click, full table export
+- **Export CSV** — per-table export
+- **Export SQL dump** — full database or single table (DROP + CREATE + INSERTs), ready to restore
+- **Import SQL** — upload a `.sql` file and execute it statement by statement, with error reporting
 - **SQL query box** — run any query, SELECT results shown inline
 - **CSRF protection** on all forms
 - **Delete rate limiting** (50 rows/hour)
+- **`ALLOW_DROP_TABLE` setting** — disable DROP TABLE globally, including inside imported SQL files
 - **Dark/light mode** toggle
 - **Auto-init** — if the DB is empty and `init.sql` exists, it runs automatically
 
@@ -57,6 +60,8 @@ define('DB_PASS',    'mypassword');
 
 define('ADMIN_USER', 'admin');
 define('ADMIN_PASS', 'admin123');
+
+define('ALLOW_DROP_TABLE', true);  // set to false to disable DROP TABLE everywhere
 ```
 
 ### 4. Run
@@ -99,7 +104,6 @@ If the database is empty on first load, meinSQL will automatically execute `init
 ## What it doesn't do
 
 - No multi-database support
-- No SQL dump / import
 - No index or foreign key management
 - No user management (MySQL users)
 - No stored procedures or views
