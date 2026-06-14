@@ -1,10 +1,16 @@
 <?php
 // ─── Credentials ────────────────────────────────────────────────────────────
+define('DB_DRIVER', 'sqlite');        // 'mysql' or 'sqlite'
+
+// MySQL / MariaDB
 define('DB_HOST', '127.0.0.1');
 define('DB_PORT', 3306);
 define('DB_NAME', 'test');
 define('DB_USER', 'meinsql');
 define('DB_PASS', 'meinsql123');
+
+// SQLite (DB_DRIVER = 'sqlite')
+define('DB_FILE', __DIR__ . '/database.db');  // path to .db file
 
 define('ADMIN_USER', 'meinsql');
 define('ADMIN_PASS', 'meinsql123');
@@ -56,15 +62,23 @@ function deleteRateCheck(): bool {
 if (isset($_GET['action']) && $_GET['action'] === 'export_sql' && !empty($_SESSION['auth'])) {
     $onlyTable = $_GET['table'] ?? '';
     $tables    = ($onlyTable && validTable($onlyTable)) ? [$onlyTable] : getTables();
-    $filename  = $onlyTable ? $onlyTable . '.sql' : DB_NAME . '_dump.sql';
+    $dbLabel   = isSqlite() ? basename(DB_FILE) : DB_NAME;
+    $filename  = $onlyTable ? $onlyTable . '.sql' : $dbLabel . '_dump.sql';
     header('Content-Type: text/plain; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . preg_replace('/[^a-zA-Z0-9_.-]/', '_', $filename) . '"');
-    echo "-- meinSQL dump\n-- Database: " . DB_NAME . "\n-- Date: " . date('Y-m-d H:i:s') . "\n\nSET FOREIGN_KEY_CHECKS=0;\n\n";
+    echo "-- meinSQL dump (" . DB_DRIVER . ")\n-- Database: $dbLabel\n-- Date: " . date('Y-m-d H:i:s') . "\n\n";
+    if (!isSqlite()) echo "SET FOREIGN_KEY_CHECKS=0;\n\n";
     foreach ($tables as $t) {
         echo "-- --------------------------------------------------------\n-- Table: `$t`\n\n";
         echo "DROP TABLE IF EXISTS " . quoteId($t) . ";\n";
-        $create = db()->query('SHOW CREATE TABLE ' . quoteId($t))->fetch();
-        echo $create['Create Table'] . ";\n\n";
+        if (isSqlite()) {
+            $sql = db()->prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?");
+            $sql->execute([$t]);
+            echo $sql->fetchColumn() . ";\n\n";
+        } else {
+            $create = db()->query('SHOW CREATE TABLE ' . quoteId($t))->fetch();
+            echo $create['Create Table'] . ";\n\n";
+        }
         $rows = db()->query('SELECT * FROM ' . quoteId($t))->fetchAll();
         if ($rows) {
             $colList = implode(', ', array_map('quoteId', array_keys($rows[0])));
@@ -78,7 +92,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'export_sql' && !empty($_SESSI
             echo "\n";
         }
     }
-    echo "SET FOREIGN_KEY_CHECKS=1;\n";
+    if (!isSqlite()) echo "SET FOREIGN_KEY_CHECKS=1;\n";
     exit;
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -190,18 +204,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $uniques  = $_POST['col_unique']   ?? [];
             $defaults = $_POST['col_defaults'] ?? [];
             if ($tbl && $names) {
-                $defs = ['`id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY'];
+                $defs = [isSqlite() ? '`id` INTEGER PRIMARY KEY' : '`id` INT UNSIGNED AUTO_INCREMENT PRIMARY KEY'];
                 foreach ($names as $i => $n) {
                     $n = preg_replace('/[^a-zA-Z0-9_]/', '', trim($n));
                     if (!$n) continue;
                     $t = $types[$i] ?? 'VARCHAR(255)';
                     if ($t === '__varchar_custom') {
-                        $t = 'VARCHAR(' . (int)($customs[$i] ?? 255) . ')';
+                        $t = isSqlite() ? 'TEXT' : 'VARCHAR(' . (int)($customs[$i] ?? 255) . ')';
                     } elseif ($t === '__enum') {
-                        $ev = array_map(fn($v) => "'" . str_replace("'","''",$v) . "'", explode(',', $customs[$i] ?? 'a'));
-                        $t = 'ENUM(' . implode(',', $ev) . ')';
+                        if (isSqlite()) { $t = 'TEXT'; }
+                        else {
+                            $ev = array_map(fn($v) => "'" . str_replace("'","''",$v) . "'", explode(',', $customs[$i] ?? 'a'));
+                            $t = 'ENUM(' . implode(',', $ev) . ')';
+                        }
                     }
-                    $allowed = ['INT','DOUBLE','TEXT','DATE','DATETIME'];
+                    $allowed = isSqlite() ? ['INTEGER','REAL','TEXT','BLOB','NUMERIC','DATE','DATETIME']
+                                          : ['INT','DOUBLE','TEXT','DATE','DATETIME'];
                     if (!in_array($t, $allowed) && !preg_match('/^(VARCHAR|ENUM)\(/i', $t)) continue;
                     $colDef  = '`' . $n . '` ' . strtoupper($t);
                     $colDef .= (($notnulls[$i] ?? '0') === '1') ? ' NOT NULL' : ' NULL';
@@ -222,13 +240,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $colName = trim($_POST['col_name'] ?? '');
             $colType = $_POST['col_type'] ?? '';
             if ($table && $colName && $colType && validTable($table)) {
-                if ($colType === '__varchar_custom') $colType = 'VARCHAR(' . (int)($_POST['col_type_custom'] ?? 255) . ')';
-                elseif ($colType === '__enum') {
-                    $ev = array_map(fn($v) => "'" . str_replace("'", "''", trim($v)) . "'",
-                                    explode(',', $_POST['col_type_custom'] ?? 'a'));
-                    $colType = 'ENUM(' . implode(',', $ev) . ')';
+                if ($colType === '__varchar_custom') {
+                    $colType = isSqlite() ? 'TEXT' : 'VARCHAR(' . (int)($_POST['col_type_custom'] ?? 255) . ')';
+                } elseif ($colType === '__enum') {
+                    if (isSqlite()) { $colType = 'TEXT'; }
+                    else {
+                        $ev = array_map(fn($v) => "'" . str_replace("'", "''", trim($v)) . "'",
+                                        explode(',', $_POST['col_type_custom'] ?? 'a'));
+                        $colType = 'ENUM(' . implode(',', $ev) . ')';
+                    }
                 }
-                $allowed = ['INT','DOUBLE','TEXT','DATE','DATETIME'];
+                $allowed = isSqlite() ? ['INTEGER','REAL','TEXT','BLOB','NUMERIC','DATE','DATETIME']
+                                      : ['INT','DOUBLE','TEXT','DATE','DATETIME'];
                 $def = in_array($colType, $allowed) ? $colType
                      : (preg_match('/^(VARCHAR|ENUM)\(/i', $colType) ? strtoupper($colType) : null);
                 if ($def) {
@@ -256,7 +279,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     header('Location: ' . $_SERVER['PHP_SELF'] . '?table=' . urlencode($table));
                     exit;
                 }
-                $stmt = db()->prepare('DELETE FROM ' . quoteId($table) . ' WHERE ' . quoteId($pk) . ' = ? LIMIT 1');
+                $stmt = db()->prepare('DELETE FROM ' . quoteId($table) . ' WHERE ' . quoteId($pk) . ' = ?');
                 $stmt->execute([$id]);
             }
             header('Location: ' . $_SERVER['PHP_SELF'] . '?table=' . urlencode($table));
@@ -347,14 +370,24 @@ function h(string $s): string {
 function db(): PDO {
     static $pdo;
     if (!$pdo) {
-        $dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', DB_HOST, DB_PORT, DB_NAME);
-        $pdo = new PDO($dsn, DB_USER, DB_PASS, [
-            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-        ]);
+        if (DB_DRIVER === 'sqlite') {
+            $pdo = new PDO('sqlite:' . DB_FILE, null, null, [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            ]);
+            $pdo->exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
+        } else {
+            $dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', DB_HOST, DB_PORT, DB_NAME);
+            $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            ]);
+        }
     }
     return $pdo;
 }
+
+function isSqlite(): bool { return DB_DRIVER === 'sqlite'; }
 
 function splitSql(string $sql): array {
     $stmts = []; $cur = ''; $inStr = false; $strCh = '';
@@ -389,6 +422,17 @@ function quoteId(string $name): string {
 }
 
 function getColumns(string $table): array {
+    if (isSqlite()) {
+        $rows = db()->query('PRAGMA table_info(' . quoteId($table) . ')')->fetchAll();
+        return array_map(fn($c) => [
+            'Field'   => $c['name'],
+            'Type'    => $c['type'] ?: 'TEXT',
+            'Null'    => $c['notnull'] ? 'NO' : 'YES',
+            'Key'     => $c['pk'] ? 'PRI' : '',
+            'Default' => $c['dflt_value'],
+            'Extra'   => ($c['pk'] && strtoupper($c['type']) === 'INTEGER') ? 'auto_increment' : '',
+        ], $rows);
+    }
     return db()->query('SHOW COLUMNS FROM ' . quoteId($table))->fetchAll();
 }
 
@@ -433,14 +477,27 @@ function getRows(string $table, int $page, int $perPage, ?string $sortCol, strin
 }
 
 function getTables(): array {
+    if (isSqlite()) {
+        $tables = db()->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+                      ->fetchAll(PDO::FETCH_COLUMN);
+        if (empty($tables)) {
+            $initFile = __DIR__ . '/init_sqlite.sql';
+            if (is_file($initFile)) {
+                foreach (splitSql(file_get_contents($initFile)) as $stmt)
+                    db()->exec($stmt);
+                $tables = db()->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+                              ->fetchAll(PDO::FETCH_COLUMN);
+            }
+        }
+        return $tables;
+    }
     $tables = db()->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
     if (empty($tables)) {
         $initFile = __DIR__ . '/init.sql';
         if (is_file($initFile)) {
             $sql = file_get_contents($initFile);
-            foreach (array_filter(array_map('trim', explode(';', $sql))) as $stmt) {
+            foreach (array_filter(array_map('trim', explode(';', $sql))) as $stmt)
                 db()->exec($stmt);
-            }
             $tables = db()->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
         }
     }
@@ -859,6 +916,15 @@ if ($activeTable && validTable($activeTable)) {
             <div style="display:flex;gap:.4rem;align-items:center;margin-bottom:.3rem">
               <input type="text" name="col_names[]" placeholder="column name" style="flex:1;margin:0" pattern="[a-zA-Z0-9_]+">
               <select name="col_types[]" class="ct-type-sel" style="flex:1;margin:0">
+                <?php if (isSqlite()): ?>
+                <option value="TEXT" selected>TEXT</option>
+                <option value="INTEGER">INTEGER</option>
+                <option value="REAL">REAL</option>
+                <option value="NUMERIC">NUMERIC</option>
+                <option value="BLOB">BLOB</option>
+                <option value="DATE">DATE</option>
+                <option value="DATETIME">DATETIME</option>
+                <?php else: ?>
                 <option value="VARCHAR(255)" selected>VARCHAR(255)</option>
                 <option value="INT">INT</option>
                 <option value="DOUBLE">DOUBLE</option>
@@ -867,6 +933,7 @@ if ($activeTable && validTable($activeTable)) {
                 <option value="DATETIME">DATETIME</option>
                 <option value="__varchar_custom">VARCHAR(n)…</option>
                 <option value="__enum">ENUM…</option>
+                <?php endif ?>
               </select>
               <input type="text" name="col_customs[]" class="ct-custom" placeholder="" style="display:none;flex:1;margin:0">
               <button type="button" class="ct-remove" style="margin:0;padding:.2rem .5rem;background:#c62828;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.75rem">×</button>
@@ -910,6 +977,15 @@ if ($activeTable && validTable($activeTable)) {
         <div class="field">
           <label>Type</label>
           <select name="col_type" id="colTypeSelect">
+            <?php if (isSqlite()): ?>
+            <option value="TEXT" selected>TEXT</option>
+            <option value="INTEGER">INTEGER</option>
+            <option value="REAL">REAL</option>
+            <option value="NUMERIC">NUMERIC</option>
+            <option value="BLOB">BLOB</option>
+            <option value="DATE">DATE</option>
+            <option value="DATETIME">DATETIME</option>
+            <?php else: ?>
             <option value="INT">INT</option>
             <option value="DOUBLE">DOUBLE</option>
             <option value="VARCHAR(255)" selected>VARCHAR(255)</option>
@@ -917,6 +993,7 @@ if ($activeTable && validTable($activeTable)) {
             <option value="DATE">DATE</option>
             <option value="__varchar_custom">VARCHAR(custom…)</option>
             <option value="__enum">ENUM(values…)</option>
+            <?php endif ?>
           </select>
           <input type="text" id="colTypeCustom" name="col_type_custom" placeholder="e.g. 100 or 'a','b','c'" style="display:none;margin-top:.4rem">
         </div>
